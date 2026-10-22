@@ -43,6 +43,9 @@ API_PATH = "/openai/v1/audio/transcriptions"
 MODELS_PATH = "/openai/v1/models"
 SIZE_LIMIT = 25 * 1024 * 1024
 CHUNK_THRESHOLD = 4 * 1024 * 1024
+OVERLAP_SEC = 3.0                   # 切块重叠秒数：每块头部带 3s 上文，交界句子由两块分别转写后择优
+PROMPT_MAX_CHARS = 220              # Whisper prompt 上限约 448 token，中文 1 字≈1-1.5 token，保守截断
+PROMPT_TAIL_CHARS = 120             # 上一块结尾带入 prompt 的字符数
 DEFAULT_PROXY = "socks5h://127.0.0.1:10808"
 DEFAULT_FROM_SRT = r"D:/jianying-subtitle-gui/app/from_srt.py"
 
@@ -78,6 +81,7 @@ def load_config():
     cfg = {"key": "", "model": "whisper-large-v3", "language": "zh",
            "hotwords": "", "proxy": DEFAULT_PROXY,
            "gen_draft": True, "draft_fix": False,
+           "prompt_boost": True, "overlap": OVERLAP_SEC,
            "from_srt_script": DEFAULT_FROM_SRT}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -177,27 +181,46 @@ def m4a_end_time(path):
         return None
 
 
-def split_audio(src, out_dir, n_chunks, ffmpeg):
+def split_audio(src, out_dir, n_chunks, ffmpeg, overlap=OVERLAP_SEC):
+    """把 src 切成 n_chunks 块，相邻块重叠 overlap 秒。
+
+    块 i 覆盖 [i*T-overlap, (i+1)*T+overlap)（首/尾块按文件边界裁剪），
+    每块头部自带 overlap 秒上文音频——交界句子由相邻两块分别转写，
+    合并时按时间重叠择优（见 _merge_segments）。
+
+    -ss 输入定位 + 流拷贝。实测（PCM 互相关，4 个采样点含非网格对齐位置）：
+    实际解码起点与 -ss 请求值误差 0.0ms——ffmpeg 定位到前一个音频包后用
+    elst 编辑列表精确修剪包内偏移。故 offset 即请求值，无需网格取整。
+
+    返回 [(块路径, 该块起始 offset 秒), ...]。
+    """
     total = m4a_end_time(src)
     if not total:
         raise RuntimeError("无法解析音频时长，切块失败。")
     seg_time = total / n_chunks
-    pattern = os.path.join(out_dir, "seg%03d.m4a")
-    cmd = [ffmpeg, "-y", "-v", "error", "-i", src,
-           "-f", "segment", "-segment_time", "%.3f" % seg_time,
-           "-c", "copy", pattern]
-    r = _run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError("ffmpeg 切块失败:\n" + (r.stderr or "")[:500])
-    files = sorted(glob.glob(os.path.join(out_dir, "seg*.m4a")))
+    ov = overlap if n_chunks > 1 else 0.0
+    if ov > seg_time * 0.4:
+        ov = seg_time * 0.4
     chunks = []
-    prev_end = 0.0
-    for fp in files:
+    for i in range(n_chunks):
+        start = max(0.0, i * seg_time - ov)
+        end = min(total, (i + 1) * seg_time + ov)
+        if end - start < 1.0:
+            continue  # 尾部残片（重叠已覆盖其内容）
+        fp = os.path.join(out_dir, "seg%03d.m4a" % i)
+        cmd = [ffmpeg, "-y", "-v", "error",
+               "-ss", "%.3f" % start, "-i", src,
+               "-c", "copy", "-t", "%.3f" % (end - start), fp]
+        r = _run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("ffmpeg 切块失败:\n" + (r.stderr or "")[:500])
         if os.path.getsize(fp) < 10240:
-            continue  # 跳过尾部空 segment
-        end = m4a_end_time(fp)
-        chunks.append((fp, prev_end))
-        prev_end = end if end else prev_end + seg_time
+            continue
+        d = m4a_end_time(fp)
+        if d and abs(d - (end - start)) > 0.5:
+            print("[warn] 块 %d 时长异常: 期望 %.1fs 实得 %.1f"
+                  % (i + 1, end - start, d))
+        chunks.append((fp, start))
     if not chunks:
         raise RuntimeError("切块后没有有效文件。")
     return chunks
@@ -465,7 +488,74 @@ def preflight(key, proxy, log):
         log("[ok] key 有效，出口区域放行")
 
 
-def _upload_one(audio_path, key, model, language, proxy, log):
+# ==================== 识别引导（prompt）与重叠合并 ====================
+
+def build_vocab_text(vocab):
+    """vocab: 字符串列表或逗号/空格分隔的字符串 -> 去重后空格连接。"""
+    if not vocab:
+        return ""
+    if isinstance(vocab, str):
+        items = re.split(r"[,，;；\s]+", vocab)
+    else:
+        items = []
+        for v in vocab:
+            items += re.split(r"[,，;；\s]+", str(v))
+    seen, out = set(), []
+    for it in items:
+        it = it.strip()
+        if it and it not in seen:
+            seen.add(it)
+            out.append(it)
+    return " ".join(out)
+
+
+def build_prompt(vocab_text, prev_tail):
+    """组 Whisper prompt：引导词 + 上一块结尾文本。
+
+    prompt 对 Whisper 是"续写引导"：词表让解码器倾向正确写法，上文尾句
+    恢复跨切块的上下文（交界处不断片）。上文放最后（紧邻解码起点）。
+    总长受 448 token 上限约束，超长时优先保上文、砍词表。
+    """
+    vocab_text = (vocab_text or "").strip()
+    prev_tail = (prev_tail or "").strip()
+    tail = prev_tail[-PROMPT_TAIL_CHARS:] if prev_tail else ""
+    p = (vocab_text + " " + tail).strip() if vocab_text else tail
+    if len(p) > PROMPT_MAX_CHARS:
+        room = PROMPT_MAX_CHARS - len(tail) - 1
+        p = (vocab_text[:room] + " " + tail).strip() if room > 20 else tail
+    return p
+
+
+def _merge_segments(all_segs):
+    """合并各块 segments（已加全局 offset），按时间重叠贪心去重。
+
+    重叠切块会在交界处产出同一句子的两份转写：按时间重叠度合并——
+    重叠超过阈值时保留时长更长的那份（通常就是未被截断的完整版），
+    仅一块有的句子（另一块漏识）原样保留，顺带完成补缺。
+    """
+    segs = [s for s in all_segs if (s.get("text") or "").strip()]
+    segs.sort(key=lambda s: (s.get("start", 0), s.get("end", 0)))
+    kept = []
+    for seg in segs:
+        ss = seg.get("start", 0)
+        se = seg.get("end", 0)
+        dup_of = None
+        for j in range(len(kept) - 1, max(-1, len(kept) - 4), -1):
+            ps, pe = kept[j].get("start", 0), kept[j].get("end", 0)
+            ov = min(pe, se) - max(ps, ss)
+            shorter = min(pe - ps, se - ss)
+            if ov > 0.45 and shorter > 0 and ov > shorter * 0.45:
+                dup_of = j
+                break
+        if dup_of is None:
+            kept.append(seg)
+        elif (se - ss) > (kept[dup_of].get("end", 0)
+                          - kept[dup_of].get("start", 0)) * 1.1:
+            kept[dup_of] = seg  # 新版本明显更完整，替换
+    return kept
+
+
+def _upload_one(audio_path, key, model, language, proxy, log, prompt=None):
     boundary = "----groqsrt" + os.urandom(16).hex()
     with open(audio_path, "rb") as f:
         file_bytes = f.read()
@@ -481,6 +571,8 @@ def _upload_one(audio_path, key, model, language, proxy, log):
     body += field("timestamp_granularities[]", "segment")
     if language:
         body += field("language", language)
+    if prompt:
+        body += field("prompt", prompt)
     body += ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
              "Content-Type: audio/mp4\r\n\r\n" % (boundary, filename)).encode("utf-8")
     body += file_bytes
@@ -502,33 +594,56 @@ def _upload_one(audio_path, key, model, language, proxy, log):
                            % type(e).__name__)
 
 
-def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag):
+def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag,
+               vocab=None, use_prompt=True, overlap=OVERLAP_SEC):
+    """转录入口：小文件直接传；>4MB 自动切块（块间重叠 overlap 秒）逐块传。
+
+    vocab: 引导词表（正确写法，list 或分隔字符串）——注入 Whisper prompt，
+            从事后正则热词变成解码期引导，专治同音词漂移。
+    use_prompt=False 时完全禁用 prompt（含上文续接）。
+    """
+    vocab_text = build_vocab_text(vocab)
     size = os.path.getsize(audio_path)
     if size <= CHUNK_THRESHOLD:
         log("[..] 上传 %.1f MB 到 Groq（代理 %s）..." % (size / 1048576.0, proxy))
-        return _upload_one(audio_path, key, model, language, proxy, log)
+        prompt = build_prompt(vocab_text, None) if use_prompt else None
+        if prompt:
+            log("[..] 注入识别引导: %s" % prompt[:60])
+        return _upload_one(audio_path, key, model, language, proxy, log,
+                           prompt=prompt)
 
     n_chunks = -(-size // CHUNK_THRESHOLD)
-    log("[..] %.1f MB 超过单传阈值，切 %d 块逐块上传..."
-        % (size / 1048576.0, n_chunks))
+    log("[..] %.1f MB 超过单传阈值，切 %d 块（重叠 %.1fs）逐块上传..."
+        % (size / 1048576.0, n_chunks, overlap))
     tmpdir = tempfile.mkdtemp(prefix="subtitle-wb-chunks-")
     try:
-        chunks = split_audio(audio_path, tmpdir, n_chunks, ffmpeg)
-        merged = []
+        chunks = split_audio(audio_path, tmpdir, n_chunks, ffmpeg, overlap=overlap)
+        all_segs = []
+        prev_tail = ""
         for i, (fp, offset) in enumerate(chunks, 1):
             if stop_flag.is_set():
                 raise RuntimeError("任务已被用户中止")
             log("[..] 块 %d/%d：%.1f MB（偏移 +%.0fs）..."
                 % (i, len(chunks), os.path.getsize(fp) / 1048576.0, offset))
-            result = _upload_one(fp, key, model, language, proxy, log)
+            prompt = build_prompt(vocab_text, prev_tail) if use_prompt else None
+            if prompt:
+                log("[..] 注入识别引导: %s" % prompt[:60])
+            result = _upload_one(fp, key, model, language, proxy, log,
+                                 prompt=prompt)
             segs = result.get("segments") or []
             if not segs:
                 raise RuntimeError("块 %d 未返回段落" % i)
             for seg in segs:
                 seg["start"] = seg.get("start", 0) + offset
                 seg["end"] = seg.get("end", 0) + offset
-                merged.append(seg)
-            log("[ok] 块 %d/%d 完成，累计 %d 条" % (i, len(chunks), len(merged)))
+                all_segs.append(seg)
+            # 本块全部文本的结尾，作为下一块的 prompt 上文（跨切块不断片）
+            prev_tail = "".join((s.get("text") or "").strip()
+                                for s in segs)[-PROMPT_TAIL_CHARS:]
+            log("[ok] 块 %d/%d 完成，累计 %d 条" % (i, len(chunks), len(all_segs)))
+        merged = _merge_segments(all_segs)
+        if len(merged) < len(all_segs):
+            log("[ok] 重叠区去重: %d -> %d 条" % (len(all_segs), len(merged)))
         return {"segments": merged}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -597,8 +712,13 @@ def process_one(audio, cfg, log, stop_flag, preflighted):
         preflight(key, proxy, log)
         preflighted[0] = True
 
+    # 热词表的"正确写法"同时用作 Whisper prompt 引导词（解码期就倾向正确词），
+    # 事后正则纠错仍然保留，双保险
+    vocab = [right for _, right in parse_hotwords(cfg.get("hotwords"))]
     result = transcribe(tmp, key, cfg.get("model") or "whisper-large-v3",
-                        cfg.get("language") or "zh", proxy, log, ffmpeg, stop_flag)
+                        cfg.get("language") or "zh", proxy, log, ffmpeg, stop_flag,
+                        vocab=vocab, use_prompt=cfg.get("prompt_boost", True),
+                        overlap=cfg.get("overlap", OVERLAP_SEC))
     segs = result.get("segments") or []
     if not segs:
         raise RuntimeError("API 未返回段落")
@@ -967,12 +1087,19 @@ class App:
             side="right")
 
         # ---- 热词纠错 ----
-        s4 = ttk.LabelFrame(frm, text=" 热词纠错（可选，每行一条: 错别字=正确词） ")
+        s4 = ttk.LabelFrame(frm, text=" 热词（每行一条: 错别字=正确词）"
+                                   "  → 识别时注入 Whisper 引导 + 识别后正则纠错 ")
         s4.pack(fill="x", **pad)
         self.hot_txt = scrolledtext.ScrolledText(s4, height=4, wrap="word",
                                                  font=("Consolas", 9))
         self.hot_txt.pack(fill="x", padx=6, pady=6)
         self.hot_txt.insert("1.0", self.cfg.get("hotwords", ""))
+        self.prompt_boost_var = tk.BooleanVar(
+            value=bool(self.cfg.get("prompt_boost", True)))
+        ttk.Checkbutton(s4, text="识别引导（热词注入 Whisper prompt + 跨切块上文续接，"
+                                 "切块重叠 3 秒）",
+                        variable=self.prompt_boost_var).pack(
+            anchor="w", padx=6, pady=(0, 6))
 
         # ---- 日志 ----
         s5 = ttk.LabelFrame(frm, text=" 日志 ")
@@ -1048,6 +1175,7 @@ class App:
         self.cfg["hotwords"] = self.hot_txt.get("1.0", "end").rstrip("\n")
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
+        self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
         if save_config(self.cfg):
             self.refresh_key_state()
@@ -1125,6 +1253,7 @@ class App:
         self.cfg["hotwords"] = self.hot_txt.get("1.0", "end").rstrip("\n")
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
+        self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
         if not self.cfg["key"]:
             messagebox.showwarning("缺少 Key",
@@ -1170,6 +1299,7 @@ class App:
             messagebox.showwarning("缺少 SRT", "未找到:\n%s" % srt)
             return
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
+        self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
         save_config(self.cfg)
         self.stop_flag.clear()
@@ -1303,6 +1433,7 @@ class App:
         self.cfg["hotwords"] = self.hot_txt.get("1.0", "end").rstrip("\n")
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
+        self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
         save_config(self.cfg)
         self.root.destroy()
