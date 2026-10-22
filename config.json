@@ -1,0 +1,10 @@
+{
+  "key": "",
+  "model": "whisper-large-v3",
+  "language": "zh",
+  "hotwords": "",
+  "proxy": "socks5h://127.0.0.1:10808",
+  "gen_draft": true,
+  "draft_fix": false,
+  "from_srt_script": "D:/jianying-subtitle-gui/app/from_srt.py"
+}
