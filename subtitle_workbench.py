@@ -48,10 +48,10 @@ OVERLAP_SEC = 3.0                   # 切块重叠秒数：每块头部带 3s �
 PROMPT_MAX_CHARS = 220              # Whisper prompt 上限约 448 token，中文 1 字≈1-1.5 token，保守截断
 PROMPT_TAIL_CHARS = 120             # 上一块结尾带入 prompt 的字符数
 DEFAULT_PROXY = "socks5h://127.0.0.1:10808"
-DEFAULT_FROM_SRT = r"D:/jianying-subtitle-gui/app/from_srt.py"
+DEFAULT_FROM_SRT = ""               # 草稿生成脚本由用户指定（属另一仓库，无内置默认路径）
 
 # ---- 漏读补扫（Whisper 块内跳读）----
-# 实测《众神》20 分钟音频：块 3 少 191 词、块 4 少 117 词，合计约 300 字
+# 实测 20 分钟讲书音频：块 3 少 191 词、块 4 少 117 词，合计约 300 字
 # 整段没输出，表现为"某段语音 6 秒只识别出 1 个字"。靠断句/纠错都救不回来
 # ——音频里有内容，文本里根本没字。用随速密度当探针：正常 4~5 字/秒，
 # 低于全片中位数的 55% 就切出来重识别。
@@ -65,13 +65,13 @@ GAP_PAD = 2.0                       # 重切音频前后各扩的秒数（给模
 # 每行 15-20 个汉字（横屏取上限）、每条 1-3 秒、话音停字幕即停。
 # 中文安全阅读速度约 4-6 字/秒，故 20 字配 6 秒上限。
 CUE_MAX_CHARS = 11                  # 单条字幕最大显示宽度（汉字计 1，英文计 0.55）
-# 实测剪映原生《众神》：703 条，中位 10 字、最长 16 字，13-16 字占 21%。
+# 实测剪映原生字幕：703 条，中位 10 字、最长 16 字，13-16 字占 21%。
 # 离线扫描 10/11/12/13/14 五档（用落盘的 6452 个词重放，不调 API）：
 #   10 -> 748 条/均 9.2 字   11 -> 691 条/均 9.9 字   12 -> 644 条/均 10.6 字
 # 11 与原生 703 条/均 9.8 字/2.23s 逐项吻合，故取 11；断点落在标点上时
 # 再放宽到 1.25 倍（≈13 字，原生最长 16 字）
 CUE_MAX_DUR = 4.5                   # 单条最长秒数
-# 实测剪映原生《众神》703 条：最长条 4.40s、>4.5s 的 0 条。原先 6.0s 会漏出 3 条
+# 实测剪映原生字幕 703 条：最长条 4.40s、>4.5s 的 0 条。原先 6.0s 会漏出 3 条
 # 4.5~5.8s 的超长条（均字数不变，纯粹是那句被念得慢）。降到 4.5 后条数只 +1
 CUE_MIN_DUR = 1.0                   # 单条最短秒数（太短会闪跳）
 BREAK_GAP = 0.6                     # 词间静音达到该值视为气口，断开（剪映停顿断句同思路）
@@ -754,7 +754,7 @@ def _explode_long_words(words, max_chars):
 def _sanitize_words(words, max_dur):
     """修正 Whisper 的畸形词时间戳，并强制全局单调。
 
-    实测《众神》6452 个词里有 2 个畸形：
+    实测 6452 个词里有 2 个畸形：
         '这' 435.35-442.31（单字跨 6.96s，把后面十几个词整个盖住）
         '一' 598.08-600.15（单字跨 2.07s）
     正常语速约 4~5 字/秒，单字跨度 0.2s 上下；"1 个字占 7 秒"只可能是 Whisper
@@ -1060,7 +1060,7 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
         if nxt is not None and c["end"] > nxt - 0.02:
             # 这里必须是 min 而不是 max(start+0.3, ...)：下一条紧邻时，
             # "至少 0.3 秒"的兜底会重新越过它，让两条字幕叠在一起
-            # （实测《众神》464.4s 处三条 0.2s 碎条互压）。宁可这一条短，
+            # （实测 464.4s 处三条 0.2s 碎条互压）。宁可这一条短，
             # 也不能压住下一条——重叠在剪映里是肉眼可见的糊字。
             c["end"] = min(c["end"], nxt - 0.02)
     # 被压到几乎没有时长的碎条：文字并进上一条，避免闪读又丢字
@@ -1161,7 +1161,7 @@ def _realign_words(words, regions):
 
     ⚠️ 这里绝不能用时间戳重排词序。Whisper 的 words 数组是模型按文本顺序
     输出、再给每个词单独回归一个时间戳；相邻词的时间戳经常重叠甚至倒挂
-    （实测《众神》：「《」比前一个「创」晚 start 0.16s、却比「作」早 0.18s，
+    （实测：「《」比前一个「创」晚 start 0.16s、却比「作」早 0.18s，
     「简」比「世」早 0.26s，「让」单字跨 0.92s）。一旦 sort(start)：
         他此前创作的《大英博物馆世界简史》风靡全球
     会被排成
@@ -1698,6 +1698,12 @@ def run_draft_gen(audio, srt, cfg, log, stop_flag):
     解耦、崩溃互不影响、单文件零依赖的定位不变。
     """
     script = cfg.get("from_srt_script") or DEFAULT_FROM_SRT
+    if not script:
+        raise RuntimeError("未设置「草稿生成脚本」路径。\n"
+                           "该脚本属于另一个仓库（jianying-subtitle-gui），本程序只通过 "
+                           "CLI 调用它，不带内置副本。\n"
+                           "两种做法：在「剪映草稿」区填上它的完整路径；"
+                           "或取消勾选「生成剪映草稿」，只导出 SRT。")
     if not os.path.isfile(script):
         raise RuntimeError("找不到 from_srt.py: %s\n"
                            "（在设置里改「草稿生成脚本」路径，或确认 "
@@ -2161,6 +2167,12 @@ class App:
             return
         if self.cfg["gen_draft"]:
             script = self.cfg["from_srt_script"] or DEFAULT_FROM_SRT
+            if not script:
+                messagebox.showwarning(
+                    "未设置草稿脚本",
+                    "勾选了「生成剪映草稿」，但没指定 from_srt.py 的路径。\n\n"
+                    "在「剪映草稿」区填上它，或取消勾选只导出 SRT。")
+                return
             if not os.path.isfile(script):
                 messagebox.showwarning(
                     "草稿生成脚本缺失",
