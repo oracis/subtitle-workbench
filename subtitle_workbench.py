@@ -60,7 +60,9 @@ CUE_MAX_CHARS = 11                  # 单条字幕最大显示宽度（汉字计
 #   10 -> 748 条/均 9.2 字   11 -> 691 条/均 9.9 字   12 -> 644 条/均 10.6 字
 # 11 与原生 703 条/均 9.8 字/2.23s 逐项吻合，故取 11；断点落在标点上时
 # 再放宽到 1.25 倍（≈13 字，原生最长 16 字）
-CUE_MAX_DUR = 6.0                   # 单条最长秒数（超了观众会丢失同步感）
+CUE_MAX_DUR = 4.5                   # 单条最长秒数
+# 实测剪映原生《众神》703 条：最长条 4.40s、>4.5s 的 0 条。原先 6.0s 会漏出 3 条
+# 4.5~5.8s 的超长条（均字数不变，纯粹是那句被念得慢）。降到 4.5 后条数只 +1
 CUE_MIN_DUR = 1.0                   # 单条最短秒数（太短会闪跳）
 BREAK_GAP = 0.6                     # 词间静音达到该值视为气口，断开（剪映停顿断句同思路）
 STRONG_MIN_CHARS = 6                # 句末标点后断开的最小累计宽度
@@ -78,7 +80,10 @@ CUE_TAIL = 0.10                     # 字幕结束比末词多留的秒数（余
 ALIGN_BREAK_GAP = 0.40              # 对齐态的断句气口门槛：区间间隔达到该值才断
 MIN_CUE_WIDTH = 4
 LOOKBACK_GAP = 0.15                 # 回看切点：宽度将超限时，回过头找 cur 内
-                                    # 间隔 >= 此值且最宽的位置断，而不是就地硬切                   # 单条最小显示宽度：低于此值的碎条并入上一条，避免闪读
+                                    # 间隔 >= 此值且最宽的位置断，而不是就地硬切
+SPAN_MAX = 2.0                      # 单个词跨度超过它、字数又很少 -> Whisper 时间
+                                    # 戳错乱（实测「这」单字跨 6.96s）
+SPAN_FIX = 0.35                     # 错乱词修正后的跨度（正常单字约 0.2~0.4s）                   # 单条最小显示宽度：低于此值的碎条并入上一条，避免闪读
 # 口播水词：剪映的断句引擎会忽略"嗯/啊"这类填充词周围的短停顿，不让它单独成条、
 # 也不在这里断句。同理：上一条以水词结尾时，跨越这个气口继续接下文。
 _FILLERS = set("嗯啊呃哦唉诶哎噢呀嘛吧呢哈")
@@ -136,6 +141,12 @@ def load_config():
         if cfg.get("cue_max_chars") in (20, 10, 13):
             cfg["cue_max_chars"] = CUE_MAX_CHARS
         cfg["cfg_ver"] = 4
+    # v5：单条最长秒数 6.0 -> 4.5。实测原生 703 条最长 4.40s、>4.5s 的 0 条，
+    # 旧默认 6.0 会漏出几条 4.5~5.8s 的超长条。同 v4 的路子：只改命中旧默认的值。
+    if cfg.get("cfg_ver", 0) < 5:
+        if cfg.get("cue_max_dur") == 6.0:
+            cfg["cue_max_dur"] = CUE_MAX_DUR
+        cfg["cfg_ver"] = 5
     return cfg
 
 
@@ -728,6 +739,59 @@ def _explode_long_words(words, max_chars):
     return out
 
 
+def _sanitize_words(words, max_dur):
+    """修正 Whisper 的畸形词时间戳，并强制全局单调。
+
+    实测《众神》6452 个词里有 2 个畸形：
+        '这' 435.35-442.31（单字跨 6.96s，把后面十几个词整个盖住）
+        '一' 598.08-600.15（单字跨 2.07s）
+    正常语速约 4~5 字/秒，单字跨度 0.2s 上下；"1 个字占 7 秒"只可能是 Whisper
+    在重复/循环片段上的时间戳错乱。不修会造成两处可见缺陷：
+        1) 该词所在字幕条被拉到 7 秒，字却只有一个
+        2) 后续词的 start 落在它内部 -> 与上一条重叠 -> 防重叠硬钳 -> 闪读条
+    修法：跨度异常且字数很少的词，end 收到 start + SPAN_FIX（不越过下一词
+    start）；再整体保证 start >= 上一词 end，消除词间重叠。
+    """
+    span_limit = min(SPAN_MAX, max_dur)
+    n = len(words)
+    out = []
+    for i, w in enumerate(words):
+        s = float(w.get("start", 0.0))
+        e = float(w.get("end", s))
+        chars = _display_width(w.get("word") or "")
+        if e - s > span_limit and chars <= 4:
+            cap = s + SPAN_FIX
+            if i + 1 < n:
+                cap = min(cap, float(words[i + 1].get("start", cap)))
+            e = max(s + 0.10, cap)
+        nw = dict(w)
+        nw["start"], nw["end"] = s, e
+        out.append(nw)
+
+    prev_end = None
+    for w in out:
+        if prev_end is not None and w["start"] < prev_end:
+            w["start"] = prev_end
+        if w["end"] <= w["start"]:
+            w["end"] = round(w["start"] + 0.08, 3)
+        prev_end = w["end"]
+    return out
+
+
+def _brk_ahead(words, i, look=3, limit_w=16.0):
+    """前方 look 个词内有没有气口，有的话累计宽度是否还在 limit_w 内。
+
+    "气口"= 该词带 brk 标记（音频对齐测出的语音区间起点，即它前面有停顿）。
+    用来支撑"宽度将超限时先别切、等前方气口"的前瞻判断。
+    """
+    acc = 0.0
+    for j in range(i + 1, min(i + 1 + look, len(words))):
+        acc += _display_width((words[j].get("word") or "").strip())
+        if words[j].get("brk"):
+            return acc <= limit_w
+    return False
+
+
 def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 min_dur=CUE_MIN_DUR, gap=BREAK_GAP):
     """把词级时间戳切成适合屏幕阅读的字幕条。
@@ -743,6 +807,8 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
     # 防御：把超宽的巨型词先切开（Groq 未返回 words 时的退化路径）
     words = _explode_long_words(words, max_chars)
     words = [w for w in words if (w.get("word") or "").strip()]
+    # 再修时间戳畸形（单字跨好几秒）并强制单调，见 _sanitize_words
+    words = _sanitize_words(words, max_dur)
     cues = []
     cur = []  # [(word, start, end), ...]
 
@@ -761,7 +827,7 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
             cues.append({"start": round(items[0][1], 3),
                          "end": round(items[-1][2] + CUE_TAIL, 3), "text": txt})
 
-    for w in words:
+    for wi, w in enumerate(words):
         t = (w.get("word") or "").strip()
         ws, we = float(w.get("start") or 0), float(w.get("end") or 0)
         if we < ws:  # 防御：个别词 end 缺失/倒挂
@@ -784,6 +850,16 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                   and any(c in t for c in _STRONG_PUNCT + _WEAK_PUNCT)
                   and cur_w >= max_chars * 0.5):
                 flush()
+            # 3.5) 前瞻：宽度将超限，但前方 3 个词内就有气口，且等到那个气口
+            #      也还在 1.5 倍上限内——就等它，别在这里硬切。
+            #      依据：剪映原生 21% 的条落在 13~16 字、最长正好 16 字，说明它
+            #      不是按固定宽度切，而是"一口气没换气就让它读完，读完再说"。
+            #      我们死守 11 字硬上限，13 字以上一条都没有，这是唯一剩下的
+            #      分布差距。
+            elif (would_w > max_chars
+                  and (we - cur[0][1]) <= max_dur * 0.8
+                  and _brk_ahead(words, wi, 3, max_chars * 1.5)):
+                pass
             # 4a) 宽度/时长兜底：先找 cue 内最近的逗号切点
             elif would_w > max_chars or (we - cur[0][1]) > max_dur:
                 cut = -1

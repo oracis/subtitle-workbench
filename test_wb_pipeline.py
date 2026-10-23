@@ -168,13 +168,16 @@ import json as _json
 import tempfile as _tf
 _cfgp = os.path.join(_tf.gettempdir(), "_wb_cfg_migrate.json")
 with open(_cfgp, "w", encoding="utf-8") as f:
-    _json.dump({"key": "k", "cue_max_chars": 20, "model": "whisper-large-v3"}, f)
+    _json.dump({"key": "k", "cue_max_chars": 20, "cue_max_dur": 6.0,
+                "model": "whisper-large-v3"}, f)
 _orig = swb.CONFIG_PATH
 swb.CONFIG_PATH = _cfgp
 _c = swb.load_config()
 assert _c["cue_max_chars"] == swb.CUE_MAX_CHARS == 11, _c["cue_max_chars"]
-assert _c.get("cfg_ver") == 4
-print("[OK] 老配置 20 字/条 -> 迁移到 %d 字" % swb.CUE_MAX_CHARS)
+assert _c["cue_max_dur"] == swb.CUE_MAX_DUR == 4.5, _c["cue_max_dur"]
+assert _c.get("cfg_ver") == 5
+print("[OK] 老配置 20 字/条 -> 迁移到 %d 字，时长 6.0 -> %.1fs"
+      % (swb.CUE_MAX_CHARS, swb.CUE_MAX_DUR))
 
 # 用户手动设过的非旧默认值必须保留
 with open(_cfgp, "w", encoding="utf-8") as f:
