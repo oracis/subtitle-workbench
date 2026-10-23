@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import ssl
+import statistics
 import struct
 import subprocess
 import sys
@@ -48,6 +49,15 @@ PROMPT_MAX_CHARS = 220              # Whisper prompt 上限约 448 token，中�
 PROMPT_TAIL_CHARS = 120             # 上一块结尾带入 prompt 的字符数
 DEFAULT_PROXY = "socks5h://127.0.0.1:10808"
 DEFAULT_FROM_SRT = r"D:/jianying-subtitle-gui/app/from_srt.py"
+
+# ---- 漏读补扫（Whisper 块内跳读）----
+# 实测《众神》20 分钟音频：块 3 少 191 词、块 4 少 117 词，合计约 300 字
+# 整段没输出，表现为"某段语音 6 秒只识别出 1 个字"。靠断句/纠错都救不回来
+# ——音频里有内容，文本里根本没字。用随速密度当探针：正常 4~5 字/秒，
+# 低于全片中位数的 55% 就切出来重识别。
+GAP_DENSITY_RATIO = 0.55            # 低于全片中位密度的比例即视为可疑
+GAP_MIN_DUR = 2.5                   # 短于此的语音段不判（样本太少易误判）
+GAP_PAD = 2.0                       # 重切音频前后各扩的秒数（给模型上下文）
 
 # ---- 字幕分段参数（依据剪映官方"按语音停顿断句"选项 + 行业字幕规范） ----
 # 剪映识别字幕官方提供「智能断句 / 按语音停顿断句」两种模式，后者专治
@@ -651,14 +661,17 @@ def _result_words(result):
 
 
 def _merge_words(all_words):
-    """合并各块 words（已加全局 offset）：按时间排序，文本+时间双重重叠判重。
+    """合并各块 words（已加全局 offset）：保持文本顺序，文本+时间双重重叠判重。
 
     重叠切块会在交界处把同一句子转写两遍，词序列几乎一致：归一化文本相同
     且时间区间显著重叠（>较短者一半）即判为同一词，保留一个并展宽时间范围
     （两侧时间戳取并集，边界更稳）。只在一块出现的词原样保留=漏识补缺。
+
+    注意：all_words 是"块序 + 块内模型输出序"，也就是正确的文本顺序，
+    这里绝不可按时间排序。Whisper 给每个词的时间戳是独立回归的，相邻词
+    经常倒挂 0.2s 上下，一排序正确字序就被打乱（见 _realign_words 注释）。
     """
     ws = [w for w in all_words if _norm_word(w.get("word"))]
-    ws.sort(key=lambda w: (w.get("start", 0), w.get("end", 0)))
     kept = []
     for w in ws:
         dup_of = None
@@ -677,7 +690,6 @@ def _merge_words(all_words):
             k = kept[dup_of]
             k["start"] = min(k["start"], w["start"])
             k["end"] = max(k["end"], w["end"])
-    kept.sort(key=lambda w: (w.get("start", 0), w.get("end", 0)))
     return kept
 
 
@@ -1146,11 +1158,33 @@ def _realign_words(words, regions):
     4) 区间首词打 brk=True —— 这就是"气口"，_split_cues 见之即断。
 
     结果：词不会落在静音里，字幕起止天然对上气口。
+
+    ⚠️ 这里绝不能用时间戳重排词序。Whisper 的 words 数组是模型按文本顺序
+    输出、再给每个词单独回归一个时间戳；相邻词的时间戳经常重叠甚至倒挂
+    （实测《众神》：「《」比前一个「创」晚 start 0.16s、却比「作」早 0.18s，
+    「简」比「世」早 0.26s，「让」单字跨 0.92s）。一旦 sort(start)：
+        他此前创作的《大英博物馆世界简史》风靡全球
+    会被排成
+        他此前创《作的大英 | 博物馆简世界》史风靡 | 全让球无数读者
+    音一个字都没错，纯粹是排序把字搬了家——这是最容易被误判成"ASR 精度差"
+    的一类缺陷。所以：保序 + 只把时间轴单调化。
     """
     if not words or not regions:
         return words
     ws = [dict(w) for w in words]
-    ws.sort(key=lambda w: (w.get("start", 0), w.get("end", 0)))
+    # 统计时间戳倒挂程度，仅用于日志（不做任何重排）
+    backwards = sum(1 for a, b in zip(ws, ws[1:])
+                    if float(b.get("start", 0)) < float(a.get("start", 0)) - 1e-6)
+    prev_s = None
+    for w in ws:                       # 保序单调化：start 只前推，不改变词序
+        s = float(w.get("start", 0.0))
+        e = float(w.get("end", s))
+        if prev_s is not None and s < prev_s:
+            s = prev_s
+        if e < s + 0.02:
+            e = s + 0.02
+        w["start"], w["end"] = s, e
+        prev_s = s
     n = len(regions)
     idx = []
     for w in ws:
@@ -1178,29 +1212,34 @@ def _realign_words(words, regions):
         grp = ws[i:j]
         rs, re_ = regions[k]
         span = max(re_ - rs, 0.02)
-        src_s = min(g["start"] for g in grp)
-        src_e = max(g["end"] for g in grp)
-        src = src_e - src_s
-        if src <= 0.02:
-            # 退化（所有词同一时刻）：按显示宽度比例铺开
-            tot = sum(max(_display_width((g.get("word") or "").strip()), 1)
-                      for g in grp) or 1
-            acc = 0.0
-            for g in grp:
-                gw = max(_display_width((g.get("word") or "").strip()), 1)
-                ns = rs + span * acc / tot
-                acc += gw
-                out.append({"word": g["word"], "start": round(ns, 3),
-                            "end": round(rs + span * acc / tot, 3)})
-        else:
-            for g in grp:
-                ns = rs + (g["start"] - src_s) / src * span
-                ne = rs + (g["end"] - src_s) / src * span
-                # 线性重映射可能溢出区间边界，钳回来
-                ns = min(max(ns, rs), re_)
-                ne = min(max(ne, ns), re_)
-                out.append({"word": g["word"], "start": round(ns, 3),
-                            "end": round(ne, 3)})
+        # 组内投影一律按显示宽度铺开，不再用 Whisper 的词时间戳。
+        # 原因：词时间戳本身抖动 ±0.2s（见函数头注释），补扫插进来的词还会
+        # 与原有词大范围重叠；一旦按时间比例映射，某个词 end 偏大就会把后面
+        # 所有词顶到区间末尾，压出一堆 0.1 秒的闪读条（实测 7 条）。
+        # 而区间是 VAD 量出来的"连续说话段"，段内语速基本均匀，按字数分配
+        # 反而最稳：同一区间里每个字的时长一致，天然单调、不重叠。
+        widths = [max(_display_width((g.get("word") or "").strip()), 1) for g in grp]
+        tot = sum(widths) or 1
+        prev_ne = rs
+        acc = 0.0
+        for g, gw in zip(grp, widths):
+            ns = rs + span * acc / tot
+            acc += gw
+            ne = rs + span * acc / tot
+            # 溢出区间边界就钳回来
+            ns = min(max(ns, rs), re_)
+            ne = min(max(ne, ns), re_)
+            # 保序单调：词序已固定，时间不许倒挂；被顶到前面就顺延，
+            # 但必须留出可见时长，否则会出现 0 时长的闪读条
+            if ns < prev_ne:
+                ns = prev_ne
+            if ns > re_ - 0.01:
+                ns = max(rs, re_ - 0.01)
+            if ne < ns + 0.01:
+                ne = min(re_, ns + 0.01)
+            prev_ne = ne
+            out.append({"word": g["word"], "start": round(ns, 3),
+                        "end": round(ne, 3)})
         # 区间首词 = 气口断点；但只有真正拉开距离（>= ALIGN_BREAK_GAP）才断，
         # 0.35~0.4s 的句中小换气不算气口，硬断会把句子切碎
         gap_before = regions[k][0] - regions[prev_k][1] if prev_k is not None else 0.0
@@ -1224,14 +1263,128 @@ def _align_words(words, audio_path, ffmpeg, log=None, enabled=ALIGN_TO_SPEECH):
         if log:
             log("[warn] 未探测到语音区间，沿用 Whisper 时间戳")
         return words
-    base = sorted(words, key=lambda w: (w.get("start", 0), w.get("end", 0)))
+    backwards = sum(1 for a, b in zip(words, words[1:])
+                    if float(b.get("start", 0)) < float(a.get("start", 0)) - 1e-6)
     out = _realign_words(words, regions)
-    moved = sum(1 for a, b in zip(base, out)
-                if abs(a.get("start", 0) - b.get("start", 0)) > 0.15)
+    moved = sum(1 for a, b in zip(words, out)
+                if abs(float(a.get("start", 0)) - float(b.get("start", 0))) > 0.15)
     if log:
         log("[ok] 音频对齐: %d 段语音，%d/%d 个词时间被校正(>0.15s)，"
-            "气口 %d 处" % (len(regions), moved, len(out),
-                            sum(1 for w in out if w.get("brk"))))
+            "气口 %d 处%s" % (len(regions), moved, len(out),
+                             sum(1 for w in out if w.get("brk")),
+                             ("；检测到 %d 处时间戳倒挂，已按文本顺序处理"
+                              % backwards) if backwards else ""))
+    return out
+
+
+def _refill_gaps(words, regions, audio_path, ffmpeg, key, model, language,
+                 proxy=None, log=print):
+    """补扫 Whisper 块内跳读：把"语速密度异常低"的语音段切出来重识别并替换。
+
+    症状：某段语音 6 秒钟只识别出 1 个字，而音频里明明说了一整句。
+    成因是 Whisper 在长音频里会成段"跳过"，prompt/温度都压不住。
+    探针：以全片中位字/秒为基准，低于 GAP_DENSITY_RATIO 或整段 0 字即可疑。
+    修法：可疑段（前后扩 GAP_PAD 秒）单独切片重新转写，只取落在该段内的词，
+    替换掉原来的低质量词；补扫结果不比原来多字就丢弃，绝不倒退。
+
+    返回新的 words（保持文本顺序），任何失败都原样返回。
+    """
+    if not words or not regions or not ffmpeg:
+        return words
+
+    n = len(regions)
+
+    def region_of(t):
+        for k in range(n):
+            if regions[k][0] <= t <= regions[k][1]:
+                return k
+        return -1
+
+    counts = [0] * n
+    for w in words:
+        k = region_of((float(w["start"]) + float(w["end"])) / 2.0)
+        if k >= 0:
+            counts[k] += len(w["word"])
+    durs = [max(regions[k][1] - regions[k][0], 0.01) for k in range(n)]
+    dens = [counts[k] / durs[k] for k in range(n)]
+    valid = [dens[k] for k in range(n) if durs[k] >= 1.0 and counts[k] > 0]
+    if len(valid) < 5:
+        return words
+    med = statistics.median(valid)
+
+    bad = [k for k in range(n)
+           if durs[k] >= GAP_MIN_DUR
+           and (counts[k] == 0 or dens[k] < GAP_DENSITY_RATIO * med)]
+    if not bad:
+        log("[ok] 漏读补扫: 未发现异常段（中位密度 %.2f 字/秒）" % med)
+        return words
+
+    blocks = []                       # 连续可疑段并成一块，减少上传次数
+    for k in bad:
+        if blocks and k == blocks[-1][1] + 1:
+            blocks[-1][1] = k
+        else:
+            blocks.append([k, k])
+
+    log("[..] 漏读补扫: %d 段可疑（中位密度 %.2f 字/秒），合并为 %d 块"
+        % (len(bad), med, len(blocks)))
+
+    tmpdir = tempfile.mkdtemp(prefix="refill_")
+    patches = []                      # [(t0, t1, [word...])]
+    try:
+        for bi, (k0, k1) in enumerate(blocks):
+            t0, t1 = float(regions[k0][0]), float(regions[k1][1])
+            s = max(0.0, t0 - GAP_PAD)
+            e = t1 + GAP_PAD
+            seg = os.path.join(tmpdir, "g%d.m4a" % bi)
+            r = subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-ss", "%.3f" % s,
+                 "-t", "%.3f" % (e - s), "-i", audio_path,
+                 "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "64k", seg],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                log("[warn] 补扫切片失败 %.1f-%.1f" % (t0, t1))
+                continue
+            try:
+                nw = _result_words(_upload_one(seg, key, model, language, proxy, log))
+            except Exception as ex:                  # noqa: BLE001 补扫不阻断主流程
+                log("[warn] 补扫识别失败 %.1f-%.1f（%s）" % (t0, t1, ex))
+                continue
+            keep = []
+            for w in nw:
+                ws_ = float(w.get("start", 0)) + s
+                we_ = float(w.get("end", 0)) + s
+                if we_ < t0 - 0.05 or ws_ > t1 + 0.05:
+                    continue                          # 落在扩边里，归邻块管
+                keep.append({"word": w["word"], "start": ws_, "end": we_})
+            old = sum(counts[k] for k in range(k0, k1 + 1))
+            new = sum(len(x["word"]) for x in keep)
+            if new <= old:
+                log("[warn] 补扫 %.1f-%.1f 没取回更多文本（%d -> %d 字），保留原样"
+                    % (t0, t1, old, new))
+                continue
+            patches.append((t0, t1, keep))
+            log("[ok] 补扫 %.1f-%.1f: %d -> %d 字" % (t0, t1, old, new))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if not patches:
+        return words
+
+    patches.sort(key=lambda p: p[0])
+    dropped = set(bad)
+    out, pi = [], 0
+    for w in words:
+        c = (float(w["start"]) + float(w["end"])) / 2.0
+        while pi < len(patches) and c > patches[pi][1]:
+            out.extend(patches[pi][2])
+            pi += 1
+        if region_of(c) in dropped:                   # 旧的低质量词由补扫结果代替
+            continue
+        out.append(w)
+    while pi < len(patches):
+        out.extend(patches[pi][2])
+        pi += 1
     return out
 
 
@@ -1337,7 +1490,29 @@ def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag,
         merged = _merge_words(all_words)
         if len(merged) < len(all_words):
             log("[ok] 重叠区去重: %d -> %d 个词" % (len(all_words), len(merged)))
-        merged = _align_words(merged, audio_path, ffmpeg, log=log, enabled=align)
+        regions = []
+        if align and ffmpeg:
+            try:
+                regions = detect_speech_regions(audio_path, ffmpeg, log=log)
+            except Exception as e:            # noqa: BLE001 探测失败不影响主流程
+                log("[warn] 音频对齐失败（%s），沿用 Whisper 时间戳" % e)
+        if regions:
+            backwards = sum(1 for x, y in zip(merged, merged[1:])
+                            if float(y.get("start", 0)) < float(x.get("start", 0)) - 1e-6)
+            merged = _realign_words(merged, regions)
+            log("[ok] 音频对齐: %d 段语音，气口 %d 处%s"
+                % (len(regions), sum(1 for w in merged if w.get("brk")),
+                   ("；检测到 %d 处时间戳倒挂，已按文本顺序处理" % backwards)
+                   if backwards else ""))
+            # 块内跳读补扫：测出语速密度异常低的语音段，切片重识别后替换
+            before = len(merged)
+            merged = _refill_gaps(merged, regions, audio_path, ffmpeg, key,
+                                  model, language, proxy, log=log)
+            if len(merged) != before:
+                merged = _realign_words(merged, regions)   # 补扫后重新钉时间/气口
+                log("[ok] 漏读补扫完成: %d -> %d 个词" % (before, len(merged)))
+        else:
+            merged = _align_words(merged, audio_path, ffmpeg, log=log, enabled=align)
         cues = _split_cues(merged, max_chars, max_dur)
         log("[ok] 智能分段: %d 个词 -> %d 条字幕" % (len(merged), len(cues)))
         return {"segments": cues}
