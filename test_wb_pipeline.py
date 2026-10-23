@@ -51,16 +51,25 @@ for i, (fp, start) in enumerate(chunks):
 print("[OK] split_audio 重叠切块 offset（0/9/24/39 节奏）: %s"
       % ["%.1f" % s for _, s in chunks])
 
-# ---------- transcribe 全链路（monkeypatch 上传） ----------
+# ---------- transcribe 全链路（monkeypatch 上传，返回词级时间戳） ----------
 VOCAB = ["心理治疗", "认知疗法"]
+
+
+def mk(text, start, dur=0.3):
+    return {"word": text, "start": start, "end": start + dur}
+
+
+# 块0（本地时间）: 一个 19 字宽的长句 + 一个跨块重复的短句
 BLOCKS = [
-    [{"start": 1.0, "end": 3.0, "text": "开场第一句。"},
-     {"start": 13.0, "end": 14.5, "text": "交界句子完整版。"},
-     {"start": 17.0, "end": 17.5, "text": "半句"}],
-    [{"start": 0.5, "end": 2.5, "text": "交界句子完整版。"},
-     {"start": 4.8, "end": 6.2, "text": "半句"},
-     {"start": 7.0, "end": 9.0, "text": "块1独有句。"}],
-    [{"start": 0.3, "end": 2.0, "text": "块2开头。"}],
+    [mk("普通", 1.0), mk("民众", 1.35), mk("在日复一日", 1.7), mk("的劳作", 2.05),
+     mk("中，", 2.4), mk("渐渐", 2.75), mk("习惯了", 3.1), mk("这套", 3.45),
+     mk("秩序。", 3.8),
+     mk("交界", 17.0), mk("句子", 17.35), mk("完整版。", 17.7)],
+    # 块1（offset 12）: 交界句子的第二份识别（时间微差）+ 独有句
+    [mk("交界", 5.0), mk("句子", 5.35), mk("完整版。", 5.7),
+     mk("块1", 6.5), mk("独有句。", 6.85)],
+    # 块2（offset 24）: 带气口的两短句（3.0 -> 5.0 之间有 1.0s 静音）
+    [mk("他", 0.3), mk("走了。", 0.65), mk("她", 2.0), mk("留下。", 2.35)],
 ]
 calls = []
 
@@ -68,7 +77,7 @@ calls = []
 def fake_upload(audio_path, key, model, language, proxy, log, prompt=None):
     idx = len(calls)
     calls.append(prompt)
-    return {"segments": [dict(s) for s in BLOCKS[idx]]}
+    return {"words": [dict(w) for w in BLOCKS[idx]]}
 
 
 swb._upload_one = fake_upload
@@ -89,19 +98,36 @@ segs = result["segments"]
 texts = [s["text"] for s in segs]
 
 assert calls[0] == "心理治疗 认知疗法", calls[0]
-assert "开场第一句" in calls[1] and calls[1].startswith("心理治疗"), calls[1]
-assert "块1独有句" in calls[2], calls[2]
+assert "秩序" in calls[1] and calls[1].startswith("心理治疗"), calls[1]
+assert "独有句" in calls[2], calls[2]
 print("[OK] prompt 链式传递（词表 + 上一块结尾）")
 
+# 词级去重：交界句子只出现一次，时间取并集（17.0-12=5.0 起，18.0-12=6.0 止）
 assert texts.count("交界句子完整版。") == 1, texts
-trunc = [s for s in segs if s["text"] == "半句"]
-assert len(trunc) == 1 and (trunc[0]["start"], trunc[0]["end"]) == (16.8, 18.2), trunc
-assert "块1独有句。" in texts and "块2开头。" in texts
+jiao = [s for s in segs if s["text"] == "交界句子完整版。"][0]
+assert (jiao["start"], jiao["end"]) == (17.0, 18.0), jiao
+# 独有句保留 + offset 正确（6.5+12=18.5；末词 7.15+12=19.15 被最小时长
+# 规则拉到 18.5+1.0=19.5，且不越过下一条 26.0）
+assert "块1独有句。" in texts
 i = texts.index("块1独有句。")
-assert (segs[i]["start"], segs[i]["end"]) == (19.0, 21.0), segs[i]
+assert (segs[i]["start"], segs[i]["end"]) == (18.5, 19.5), segs[i]
+# 块2 气口断开：他走了。/ 她留下。 两条，全局 24.3 / 26.0
+assert "他走了。" in texts and "她留下。" in texts, texts
+i = texts.index("她留下。")
+assert abs(segs[i]["start"] - 26.0) < 1e-6, segs[i]
+# 22 字宽长句超过 20 上限 -> 在最近的逗号处切开（不是堆成大块也不是硬切）
+assert "普通民众在日复一日的劳作中，" in texts, texts
+assert "渐渐习惯了这套秩序。" in texts, texts
+# 每条都不超宽、不超时长、不重叠
+for s in segs:
+    assert swb._display_width(s["text"]) <= 20.0001, s
+    assert s["end"] - s["start"] <= 6.0 + 1e-6, s
+    assert s["end"] > s["start"], s
 starts = [s["start"] for s in segs]
 assert starts == sorted(starts)
-print("[OK] 去重/完整版替换/offset/时序")
+assert all(segs[k]["end"] <= segs[k + 1]["start"] - 0.019
+           for k in range(len(segs) - 1)), segs
+print("[OK] 词级去重/offset/气口断开/宽度与时长约束/防重叠")
 
 # ---------- multipart body 含 prompt ----------
 captured = {}
