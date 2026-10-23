@@ -121,6 +121,14 @@ def load_config():
             cfg.update(json.load(f))
     except Exception:
         pass
+    # ---- 配置迁移 ----
+    # 老配置文件里 cue_max_chars 存的是当时的默认值 20，会盖掉新版默认的 10，
+    # 导致"改了代码但用户看到的还是 20 字一行"。凡是没打 cfg_ver 的老配置，
+    # 且值正好等于旧默认 20，就按新默认走；用户手动设过的其它值不动。
+    if cfg.get("cfg_ver", 0) < 2:
+        if cfg.get("cue_max_chars") == 20:
+            cfg["cue_max_chars"] = CUE_MAX_CHARS
+        cfg["cfg_ver"] = 2
     return cfg
 
 

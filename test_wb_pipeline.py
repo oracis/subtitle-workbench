@@ -163,5 +163,25 @@ swb.transcribe(big, "gsk_test", "whisper-large-v3", "zh", None,
 assert all(c is None for c in calls)
 print("[OK] use_prompt=False 时完全不注入")
 
+# ---------- 配置迁移：老配置里的 cue_max_chars=20 应升到新默认 10 ----------
+import json as _json
+import tempfile as _tf
+_cfgp = os.path.join(_tf.gettempdir(), "_wb_cfg_migrate.json")
+with open(_cfgp, "w", encoding="utf-8") as f:
+    _json.dump({"key": "k", "cue_max_chars": 20, "model": "whisper-large-v3"}, f)
+_orig = swb.CONFIG_PATH
+swb.CONFIG_PATH = _cfgp
+_c = swb.load_config()
+assert _c["cue_max_chars"] == swb.CUE_MAX_CHARS == 10, _c["cue_max_chars"]
+assert _c.get("cfg_ver") == 2
+print("[OK] 老配置 20 字/条 -> 迁移到 %d 字" % swb.CUE_MAX_CHARS)
+
+# 用户手动设过的非旧默认值必须保留
+with open(_cfgp, "w", encoding="utf-8") as f:
+    _json.dump({"cue_max_chars": 14}, f)
+assert swb.load_config()["cue_max_chars"] == 14
+swb.CONFIG_PATH = _orig
+print("[OK] 手动设置的非默认值不被迁移覆盖")
+
 print("\nALL PASS")
 sys.exit(0)
