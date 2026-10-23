@@ -828,14 +828,28 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 kept.append(c)
         cues = kept
 
-    # 时长下限 + 防重叠：太短的条拉长到 min_dur，且不越过下一条起点
+    # 时长下限 + 防重叠：太短的条拉长到 min_dur；任何情况下都不许压住下一条
     for i, c in enumerate(cues):
         nxt = cues[i + 1]["start"] if i + 1 < len(cues) else None
         if c["end"] - c["start"] < min_dur:
             c["end"] = c["start"] + min_dur
         if nxt is not None and c["end"] > nxt - 0.02:
-            c["end"] = max(c["start"] + 0.3, nxt - 0.02)
-    return cues
+            # 这里必须是 min 而不是 max(start+0.3, ...)：下一条紧邻时，
+            # "至少 0.3 秒"的兜底会重新越过它，让两条字幕叠在一起
+            # （实测《众神》464.4s 处三条 0.2s 碎条互压）。宁可这一条短，
+            # 也不能压住下一条——重叠在剪映里是肉眼可见的糊字。
+            c["end"] = min(c["end"], nxt - 0.02)
+    # 被压到几乎没有时长的碎条：文字并进上一条，避免闪读又丢字
+    merged = []
+    for c in cues:
+        if merged and (c["end"] - c["start"]) < 0.05:
+            p = merged[-1]
+            if _display_width(p["text"]) + _display_width(c["text"]) <= max_chars:
+                p["text"] += c["text"]
+                p["end"] = max(p["end"], c["end"])
+                continue
+        merged.append(c)
+    return merged
 
 
 def _parse_db(text, key):
