@@ -54,12 +54,31 @@ DEFAULT_FROM_SRT = r"D:/jianying-subtitle-gui/app/from_srt.py"
 # 断句错位——即本工具的"气口断开"。行业规范（多家剪辑指南一致）：
 # 每行 15-20 个汉字（横屏取上限）、每条 1-3 秒、话音停字幕即停。
 # 中文安全阅读速度约 4-6 字/秒，故 20 字配 6 秒上限。
-CUE_MAX_CHARS = 20                  # 单条字幕最大显示宽度（汉字计 1，英文计 0.55）
+CUE_MAX_CHARS = 10                  # 单条字幕最大显示宽度（汉字计 1，英文计 0.55）
+# 实测剪映原生识别：老版平均 10.1 字/条（684 条样本，中位 9），新版开头
+# 更是切成 6+6+8 字。真正的断句主力是气口（见 _realign_words 的 brk 标记），
+# 这里的宽度上限只做兜底，10 字留给语义断句余量
 CUE_MAX_DUR = 6.0                   # 单条最长秒数（超了观众会丢失同步感）
 CUE_MIN_DUR = 1.0                   # 单条最短秒数（太短会闪跳）
 BREAK_GAP = 0.6                     # 词间静音达到该值视为气口，断开（剪映停顿断句同思路）
 STRONG_MIN_CHARS = 6                # 句末标点后断开的最小累计宽度
 WEAK_BREAK_RATIO = 0.55             # 逗号级断点：累计宽度达到上限该比例才断
+
+# ---- 音频对齐参数（用真实语音区间校正 Whisper 漂移的时间戳） ----
+# Whisper 的词级时间戳是"推断"的而非"测量"的：时间 token 由模型像普通 token
+# 一样预测，segment 内的长停顿会把它整体拉偏（社区公认的 "drift after
+# silences"）。stable-ts 为此提供 adjust_by_silence()：先用静音检测拿到音频
+# 里真实的语音区间，再把词钉回去。这里用 ffmpeg silencedetect 实现，零依赖。
+ALIGN_TO_SPEECH = True              # 用音频静音区校正词时间戳（关掉=完全信 Whisper）
+SILENCE_MIN_DUR = 0.35              # 短于此值的停顿不算语音区间边界
+SPEECH_MIN_DUR = 0.12               # 短于此值的"语音"碎片视为噪声丢弃
+CUE_TAIL = 0.10                     # 字幕结束比末词多留的秒数（余韵，勿越入长停顿）
+ALIGN_BREAK_GAP = 0.40              # 对齐态的断句气口门槛：区间间隔达到该值才断
+MIN_CUE_WIDTH = 4                   # 单条最小显示宽度：低于此值的碎条并入上一条，避免闪读
+# 口播水词：剪映的断句引擎会忽略"嗯/啊"这类填充词周围的短停顿，不让它单独成条、
+# 也不在这里断句。同理：上一条以水词结尾时，跨越这个气口继续接下文。
+_FILLERS = set("嗯啊呃哦唉诶哎噢呀嘛吧呢哈")
+SOFT_GAP = 0.25                     # 软断点：短停顿 + 标点同时命中才切（剪映加权思路）
 
 # PyInstaller onefile：__file__ 指向临时解压目录，配置要跟 exe 走
 if getattr(sys, "frozen", False):
@@ -94,6 +113,7 @@ def load_config():
            "hotwords": "", "proxy": DEFAULT_PROXY,
            "gen_draft": True, "draft_fix": False,
            "prompt_boost": True, "overlap": OVERLAP_SEC,
+           "align_to_speech": ALIGN_TO_SPEECH,
            "cue_max_chars": CUE_MAX_CHARS, "cue_max_dur": CUE_MAX_DUR,
            "from_srt_script": DEFAULT_FROM_SRT}
     try:
@@ -635,17 +655,78 @@ def _merge_words(all_words):
     return kept
 
 
+def _ends_with_filler(text):
+    """末尾是口播水词（嗯/啊/呃…）？用于跳过水词处的气口断句。"""
+    t = _PUNCT_RE.sub("", text or "")
+    return bool(t) and t[-1] in _FILLERS
+
+
+def _explode_long_words(words, max_chars):
+    """把超宽的单个"词"二次切开，时间按显示宽度比例分配。
+
+    Groq 偶尔只返回 segments 不给 words（或个别 chunk 的粒度异常粗），
+    此时一个"词"就是整段几十上百字——不切开会生成一条几十秒的巨型字幕
+    （实测旧草稿里出现过 223 字 / 59 秒的单条）。切分优先落在标点上，
+    其次按宽度硬切，时间按字数比例摊到各片。
+    """
+    out = []
+    for w in words:
+        t = (w.get("word") or "").strip()
+        if _display_width(t) <= max_chars * 1.6:
+            out.append(w)
+            continue
+        # 先按标点切成小块
+        parts, buf = [], ""
+        for ch in t:
+            buf += ch
+            if ch in _STRONG_PUNCT or ch in _WEAK_PUNCT:
+                parts.append(buf)
+                buf = ""
+        if buf:
+            parts.append(buf)
+        # 过宽的块再按显示宽度硬切
+        pieces = []
+        for pt in parts:
+            while _display_width(pt) > max_chars:
+                acc, cut = 0.0, len(pt)
+                for idx, ch in enumerate(pt):
+                    acc += _display_width(ch)
+                    if acc > max_chars:
+                        cut = max(1, idx)
+                        break
+                pieces.append(pt[:cut])
+                pt = pt[cut:]
+            if pt:
+                pieces.append(pt)
+        total = sum(_display_width(p) for p in pieces) or 1.0
+        s0, e0 = w.get("start", 0), w.get("end", 0)
+        acc = 0.0
+        for k, p in enumerate(pieces):
+            pw = _display_width(p)
+            nw = {"word": p,
+                  "start": round(s0 + (e0 - s0) * acc / total, 3),
+                  "end": round(s0 + (e0 - s0) * (acc + pw) / total, 3)}
+            if k == 0 and w.get("brk"):
+                nw["brk"] = True
+            out.append(nw)
+            acc += pw
+    return out
+
+
 def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 min_dur=CUE_MIN_DUR, gap=BREAK_GAP):
     """把词级时间戳切成适合屏幕阅读的字幕条。
 
     断开优先级（从高到低）：
+    0. 真实气口——词带 brk 标记（音频对齐测出的语音区间起点），见之即断
     1. 句末标点（。！？；…）——句子说完就断
-    2. 气口——词间静音 >= gap 秒（说话人换气/停顿）
+    2. 气口——词间静音 >= gap 秒（说话人换气/停顿；无对齐时的退化判据）
     3. 逗号级标点（，、：等）——累计宽度过半才断，避免碎句
     4. 兜底——累计宽度/时长将超上限时，在最近的逗号处切；没有就硬切
-    每条 cue: start=首词 start，end=末词 end，text=拼接（去首尾空白）。
+    每条 cue: start=首词 start，end=末词 end + 余韵 CUE_TAIL，text=拼接。
     """
+    # 防御：把超宽的巨型词先切开（Groq 未返回 words 时的退化路径）
+    words = _explode_long_words(words, max_chars)
     words = [w for w in words if (w.get("word") or "").strip()]
     cues = []
     cur = []  # [(word, start, end), ...]
@@ -663,7 +744,7 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
         txt = text_of(items).strip()
         if txt:
             cues.append({"start": round(items[0][1], 3),
-                         "end": round(items[-1][2], 3), "text": txt})
+                         "end": round(items[-1][2] + CUE_TAIL, 3), "text": txt})
 
     for w in words:
         t = (w.get("word") or "").strip()
@@ -675,8 +756,18 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
             silence = ws - prev_end
             cur_w = _display_width(text_of(cur))
             would_w = cur_w + _display_width(t)
-            # 1) 气口断开
-            if silence >= gap and cur_w >= 4:
+            # 0) 真实气口：音频对齐判定此处有停顿，且已有足够内容才断；
+            #    但上一条停在"嗯/啊"这类水词上时不切（口播换气不该单独成条）
+            if w.get("brk") and cur_w >= 4 and not _ends_with_filler(text_of(cur)):
+                flush()
+            # 1) 气口断开（无 brk 标记时的退化判据）
+            elif silence >= gap and cur_w >= 4:
+                flush()
+            # 2) 软断点：短停顿(0.25~气口阈值) + 标点 + 已积够半数宽度，三条
+            #    信号叠加到阈值以上才切——单看任何一条都不够（剪映的加权思路）
+            elif (silence >= SOFT_GAP
+                  and any(c in t for c in _STRONG_PUNCT + _WEAK_PUNCT)
+                  and cur_w >= max_chars * 0.5):
                 flush()
             # 4a) 宽度/时长兜底：先找 cue 内最近的逗号切点
             elif would_w > max_chars or (we - cur[0][1]) > max_dur:
@@ -689,6 +780,12 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 if cut >= 0:
                     head, cur = cur[:cut + 1], cur[cut + 1:]
                     flush(head)
+                elif (any(c in t for c in _WEAK_PUNCT)
+                      and would_w <= max_chars * 1.3):
+                    # 断点正好落在标点上：允许小幅超宽，别把词劈开
+                    cur.append((t, ws, we))
+                    flush()
+                    continue
                 else:
                     flush()
         cur.append((t, ws, we))
@@ -702,6 +799,27 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
             flush()
     flush()
 
+    # 孤儿条合并：宽度不足 MIN_CUE_WIDTH 的碎条并入上一条（避免 1-3 字闪读），
+    # 前提是合并后不超宽。宁可上一条多停 0.2s，也别闪一屏 2 个字。
+    if len(cues) > 1:
+        kept = [cues[0]]
+        for c in cues[1:]:
+            p = kept[-1]
+            # 只在"又短又快"且前面没有大停顿时才合并：
+            # 文本窄 + 停留不足 min_dur = 闪读；若前面已有 >= BREAK_GAP 的
+            # 大停顿则保持独立（宁可短一点，也不要让上一条跨过气口）。
+            too_short = (_display_width(c["text"]) < MIN_CUE_WIDTH
+                         and (c["end"] - c["start"]) < min_dur)
+            small_gap = (c["start"] - p["end"]) < BREAK_GAP
+            if (too_short and small_gap
+                    and _display_width(p["text"]) + _display_width(c["text"])
+                    <= max_chars):
+                p["text"] += c["text"]
+                p["end"] = max(p["end"], c["end"])
+            else:
+                kept.append(c)
+        cues = kept
+
     # 时长下限 + 防重叠：太短的条拉长到 min_dur，且不越过下一条起点
     for i, c in enumerate(cues):
         nxt = cues[i + 1]["start"] if i + 1 < len(cues) else None
@@ -710,6 +828,177 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
         if nxt is not None and c["end"] > nxt - 0.02:
             c["end"] = max(c["start"] + 0.3, nxt - 0.02)
     return cues
+
+
+def _parse_db(text, key):
+    m = re.search(key + r":\s*(-?\d+(?:\.\d+)?)\s*dB", text or "")
+    return float(m.group(1)) if m else None
+
+
+def _parse_silences(text):
+    """从 silencedetect 的输出里解析静音区间 [(start, end), ...]。"""
+    out, cur = [], None
+    for line in (text or "").splitlines():
+        m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        if m:
+            cur = max(0.0, float(m.group(1)))
+            continue
+        m = re.search(r"silence_end:\s*(-?[\d.]+)", line)
+        if m and cur is not None:
+            out.append((cur, float(m.group(1))))
+            cur = None
+    if cur is not None:          # 一直静到文件结尾
+        out.append((cur, float("inf")))
+    return out
+
+
+def detect_speech_regions(audio_path, ffmpeg, log=None,
+                          min_sil=SILENCE_MIN_DUR, min_speech=SPEECH_MIN_DUR):
+    """从波形直接测出真实说话区间，返回 [(start, end), ...]（秒）。
+
+    先 volumedetect 拿整体响度，据此自适应定噪声门限（均值 -8dB，夹在
+    -45..-26dB），再 silencedetect 找静音段，取补集即语音段。探测不到任何
+    静音（底噪大/门限过高）时降 6dB 重试一次。
+
+    这份区间是从音频量出来的地面真值——Whisper 的时间戳是模型"推断"的，
+    遇到 segment 内长停顿会整体偏移，必须用它来纠正。
+    """
+    def run_detect(noise_db):
+        af = "silencedetect=noise=%ddB:d=%.2f" % (int(round(noise_db)), min_sil)
+        r = _run([ffmpeg, "-hide_banner", "-nostats", "-i", audio_path,
+                  "-af", af, "-f", "null", "-"],
+                 capture_output=True, text=True,
+                 encoding="utf-8", errors="ignore")
+        return r.stderr or ""
+
+    def probe_mean():
+        r = _run([ffmpeg, "-hide_banner", "-nostats", "-i", audio_path,
+                  "-af", "volumedetect", "-f", "null", "-"],
+                 capture_output=True, text=True,
+                 encoding="utf-8", errors="ignore")
+        return _parse_db(r.stderr or "", "mean_volume")
+
+    mean_db = probe_mean()
+    noise_db = -35.0 if mean_db is None else max(-45.0, min(-26.0, mean_db - 8.0))
+    silences = _parse_silences(run_detect(noise_db))
+    if not silences:
+        alt = _parse_silences(run_detect(noise_db - 6.0))
+        if alt:
+            silences, noise_db = alt, noise_db - 6.0
+    if not silences:
+        return []
+
+    total = m4a_end_time(audio_path) or 0.0
+    regions, pos = [], 0.0
+    for s, e in silences:
+        e = min(e, total) if total else e
+        if s - pos >= min_speech:
+            regions.append((pos, s))
+        pos = max(pos, e)
+    if total and total - pos >= min_speech:
+        regions.append((pos, total))
+    if log:
+        log("[..] 静音检测: 门限 %ddB，%d 段停顿 -> %d 段语音"
+            % (int(round(noise_db)), len(silences), len(regions)))
+    return regions
+
+
+def _realign_words(words, regions):
+    """把词时间戳钉到真实语音区间上，并在每个气口打上断句标记。
+
+    1) 每个词归到与之重叠最多（无重叠则中心最近）的语音区间；
+    2) 强制区间序号单调不减（词序不可逆，避免交叉）；
+    3) 同区间的词按 Whisper 给的相对位置线性重映射到该区间的真实起止；
+    4) 区间首词打 brk=True —— 这就是"气口"，_split_cues 见之即断。
+
+    结果：词不会落在静音里，字幕起止天然对上气口。
+    """
+    if not words or not regions:
+        return words
+    ws = [dict(w) for w in words]
+    ws.sort(key=lambda w: (w.get("start", 0), w.get("end", 0)))
+    n = len(regions)
+    idx = []
+    for w in ws:
+        s, e = w["start"], w["end"]
+        best, best_ov = -1, 0.0
+        for k, (rs, re_) in enumerate(regions):
+            ov = min(e, re_) - max(s, rs)
+            if ov > best_ov:
+                best_ov, best = ov, k
+        if best < 0:
+            c = (s + e) / 2.0
+            best = min(range(n), key=lambda k: abs(
+                (regions[k][0] + regions[k][1]) / 2.0 - c))
+        idx.append(best)
+    for i in range(1, len(idx)):
+        if idx[i] < idx[i - 1]:
+            idx[i] = idx[i - 1]
+
+    out, i, prev_k = [], 0, None
+    while i < len(ws):
+        k = idx[i]
+        j = i
+        while j < len(ws) and idx[j] == k:
+            j += 1
+        grp = ws[i:j]
+        rs, re_ = regions[k]
+        span = max(re_ - rs, 0.02)
+        src_s = min(g["start"] for g in grp)
+        src_e = max(g["end"] for g in grp)
+        src = src_e - src_s
+        if src <= 0.02:
+            # 退化（所有词同一时刻）：按显示宽度比例铺开
+            tot = sum(max(_display_width((g.get("word") or "").strip()), 1)
+                      for g in grp) or 1
+            acc = 0.0
+            for g in grp:
+                gw = max(_display_width((g.get("word") or "").strip()), 1)
+                ns = rs + span * acc / tot
+                acc += gw
+                out.append({"word": g["word"], "start": round(ns, 3),
+                            "end": round(rs + span * acc / tot, 3)})
+        else:
+            for g in grp:
+                ns = rs + (g["start"] - src_s) / src * span
+                ne = rs + (g["end"] - src_s) / src * span
+                # 线性重映射可能溢出区间边界，钳回来
+                ns = min(max(ns, rs), re_)
+                ne = min(max(ne, ns), re_)
+                out.append({"word": g["word"], "start": round(ns, 3),
+                            "end": round(ne, 3)})
+        # 区间首词 = 气口断点；但只有真正拉开距离（>= ALIGN_BREAK_GAP）才断，
+        # 0.35~0.4s 的句中小换气不算气口，硬断会把句子切碎
+        gap_before = regions[k][0] - regions[prev_k][1] if prev_k is not None else 0.0
+        out[-len(grp)]["brk"] = prev_k is not None and gap_before >= ALIGN_BREAK_GAP
+        prev_k = k
+        i = j
+    return out
+
+
+def _align_words(words, audio_path, ffmpeg, log=None, enabled=ALIGN_TO_SPEECH):
+    """按音频真实语音区间校正词时间戳；失败时原样返回（不阻断转录）。"""
+    if not enabled or not ffmpeg or not words:
+        return words
+    try:
+        regions = detect_speech_regions(audio_path, ffmpeg, log=log)
+    except Exception as e:                       # noqa: BLE001 探测失败不影响主流程
+        if log:
+            log("[warn] 音频对齐失败（%s），沿用 Whisper 时间戳" % e)
+        return words
+    if not regions:
+        if log:
+            log("[warn] 未探测到语音区间，沿用 Whisper 时间戳")
+        return words
+    base = sorted(words, key=lambda w: (w.get("start", 0), w.get("end", 0)))
+    out = _realign_words(words, regions)
+    moved = sum(1 for a, b in zip(base, out)
+                if abs(a.get("start", 0) - b.get("start", 0)) > 0.15)
+    if log:
+        log("[ok] 音频对齐: %d 段语音，%d/%d 个词时间被校正(>0.15s)，"
+            "气口 %d 处" % (len(regions), moved, len(out),
+                            sum(1 for w in out if w.get("brk"))))
+    return out
 
 
 def _upload_one(audio_path, key, model, language, proxy, log, prompt=None):
@@ -755,12 +1044,13 @@ def _upload_one(audio_path, key, model, language, proxy, log, prompt=None):
 
 def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag,
                vocab=None, use_prompt=True, overlap=OVERLAP_SEC,
-               max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR):
+               max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
+               align=ALIGN_TO_SPEECH):
     """转录入口：小文件直接传；>4MB 自动切块（块间重叠 overlap 秒）逐块传。
 
-    流程：词级时间戳 -> 跨块合并去重（_merge_words）-> 智能分段
-    （_split_cues：句末标点/气口/逗号/宽度兜底）-> 返回 segments 形式的
-    cues（start/end/text），SRT 生成与草稿导入接口不变。
+    流程：词级时间戳 -> 跨块合并去重（_merge_words）-> 音频对齐
+    （_align_words：用真实语音区间校正 Whisper 漂移，并在气口打标记）->
+    智能分段（_split_cues）-> 返回 segments 形式的 cues（start/end/text）。
 
     vocab: 引导词表（正确写法，list 或分隔字符串）——注入 Whisper prompt，
             从事后正则热词变成解码期引导，专治同音词漂移。
@@ -778,6 +1068,7 @@ def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag,
         words = _result_words(result)
         if not words:
             raise RuntimeError("API 未返回词级时间戳")
+        words = _align_words(words, audio_path, ffmpeg, log=log, enabled=align)
         return {"segments": _split_cues(words, max_chars, max_dur)}
 
     n_chunks = -(-size // CHUNK_THRESHOLD)
@@ -812,6 +1103,7 @@ def transcribe(audio_path, key, model, language, proxy, log, ffmpeg, stop_flag,
         merged = _merge_words(all_words)
         if len(merged) < len(all_words):
             log("[ok] 重叠区去重: %d -> %d 个词" % (len(all_words), len(merged)))
+        merged = _align_words(merged, audio_path, ffmpeg, log=log, enabled=align)
         cues = _split_cues(merged, max_chars, max_dur)
         log("[ok] 智能分段: %d 个词 -> %d 条字幕" % (len(merged), len(cues)))
         return {"segments": cues}
@@ -890,7 +1182,8 @@ def process_one(audio, cfg, log, stop_flag, preflighted):
                         vocab=vocab, use_prompt=cfg.get("prompt_boost", True),
                         overlap=cfg.get("overlap", OVERLAP_SEC),
                         max_chars=cfg.get("cue_max_chars", CUE_MAX_CHARS),
-                        max_dur=cfg.get("cue_max_dur", CUE_MAX_DUR))
+                        max_dur=cfg.get("cue_max_dur", CUE_MAX_DUR),
+                        align=cfg.get("align_to_speech", ALIGN_TO_SPEECH))
     segs = result.get("segments") or []
     if not segs:
         raise RuntimeError("API 未返回字幕")
@@ -1271,6 +1564,12 @@ class App:
         ttk.Checkbutton(s4, text="识别引导（热词注入 Whisper prompt + 跨切块上文续接，"
                                  "切块重叠 3 秒）",
                         variable=self.prompt_boost_var).pack(
+            anchor="w", padx=6, pady=(0, 2))
+        self.align_var = tk.BooleanVar(
+            value=bool(self.cfg.get("align_to_speech", ALIGN_TO_SPEECH)))
+        ttk.Checkbutton(s4, text="音频对齐（测音频真实停顿来校正 Whisper 的时间漂移，"
+                                 "字幕从气口起、到气口止；关掉=完全信任识别时间戳）",
+                        variable=self.align_var).pack(
             anchor="w", padx=6, pady=(0, 6))
 
         # ---- 字幕分段：单行宽度 ----
@@ -1280,7 +1579,7 @@ class App:
                             "按屏幕宽度与气口自动断句）:").pack(side="left")
         self.cue_chars_var = tk.IntVar(
             value=int(self.cfg.get("cue_max_chars", CUE_MAX_CHARS) or CUE_MAX_CHARS))
-        ttk.Spinbox(row, from_=10, to=30, width=4, textvariable=self.cue_chars_var
+        ttk.Spinbox(row, from_=6, to=30, width=4, textvariable=self.cue_chars_var
                     ).pack(side="left", padx=6)
 
         # ---- 日志 ----
@@ -1358,8 +1657,9 @@ class App:
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
         self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
+        self.cfg["align_to_speech"] = bool(self.align_var.get())
         try:
-            self.cfg["cue_max_chars"] = max(8, min(40, int(self.cue_chars_var.get())))
+            self.cfg["cue_max_chars"] = max(6, min(40, int(self.cue_chars_var.get())))
         except (TypeError, ValueError):
             self.cfg["cue_max_chars"] = CUE_MAX_CHARS
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
@@ -1440,8 +1740,9 @@ class App:
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
         self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
+        self.cfg["align_to_speech"] = bool(self.align_var.get())
         try:
-            self.cfg["cue_max_chars"] = max(8, min(40, int(self.cue_chars_var.get())))
+            self.cfg["cue_max_chars"] = max(6, min(40, int(self.cue_chars_var.get())))
         except (TypeError, ValueError):
             self.cfg["cue_max_chars"] = CUE_MAX_CHARS
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
@@ -1490,8 +1791,9 @@ class App:
             return
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
         self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
+        self.cfg["align_to_speech"] = bool(self.align_var.get())
         try:
-            self.cfg["cue_max_chars"] = max(8, min(40, int(self.cue_chars_var.get())))
+            self.cfg["cue_max_chars"] = max(6, min(40, int(self.cue_chars_var.get())))
         except (TypeError, ValueError):
             self.cfg["cue_max_chars"] = CUE_MAX_CHARS
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()
@@ -1628,8 +1930,9 @@ class App:
         self.cfg["gen_draft"] = bool(self.gen_draft_var.get())
         self.cfg["draft_fix"] = bool(self.draft_fix_var.get())
         self.cfg["prompt_boost"] = bool(self.prompt_boost_var.get())
+        self.cfg["align_to_speech"] = bool(self.align_var.get())
         try:
-            self.cfg["cue_max_chars"] = max(8, min(40, int(self.cue_chars_var.get())))
+            self.cfg["cue_max_chars"] = max(6, min(40, int(self.cue_chars_var.get())))
         except (TypeError, ValueError):
             self.cfg["cue_max_chars"] = CUE_MAX_CHARS
         self.cfg["from_srt_script"] = self.fromsrt_var.get().strip()

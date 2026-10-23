@@ -93,7 +93,8 @@ big = os.path.join(tmp, "big.m4a")
 with open(big, "wb") as f:
     f.write(b"\x00" * (5 * 1024 * 1024))
 result = swb.transcribe(big, "gsk_test", "whisper-large-v3", "zh", None,
-                        LOG, FFMPEG, STOP, vocab=VOCAB, use_prompt=True)
+                        LOG, FFMPEG, STOP, vocab=VOCAB, use_prompt=True, align=False,
+                        max_chars=20)
 segs = result["segments"]
 texts = [s["text"] for s in segs]
 
@@ -105,7 +106,7 @@ print("[OK] prompt 链式传递（词表 + 上一块结尾）")
 # 词级去重：交界句子只出现一次，时间取并集（17.0-12=5.0 起，18.0-12=6.0 止）
 assert texts.count("交界句子完整版。") == 1, texts
 jiao = [s for s in segs if s["text"] == "交界句子完整版。"][0]
-assert (jiao["start"], jiao["end"]) == (17.0, 18.0), jiao
+assert (jiao["start"], jiao["end"]) == (17.0, 18.1), jiao  # 末词 18.0 + CUE_TAIL 0.1
 # 独有句保留 + offset 正确（6.5+12=18.5；末词 7.15+12=19.15 被最小时长
 # 规则拉到 18.5+1.0=19.5，且不越过下一条 26.0）
 assert "块1独有句。" in texts
