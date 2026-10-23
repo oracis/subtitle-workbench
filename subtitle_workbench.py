@@ -54,10 +54,12 @@ DEFAULT_FROM_SRT = r"D:/jianying-subtitle-gui/app/from_srt.py"
 # 断句错位——即本工具的"气口断开"。行业规范（多家剪辑指南一致）：
 # 每行 15-20 个汉字（横屏取上限）、每条 1-3 秒、话音停字幕即停。
 # 中文安全阅读速度约 4-6 字/秒，故 20 字配 6 秒上限。
-CUE_MAX_CHARS = 10                  # 单条字幕最大显示宽度（汉字计 1，英文计 0.55）
-# 实测剪映原生识别：老版平均 10.1 字/条（684 条样本，中位 9），新版开头
-# 更是切成 6+6+8 字。真正的断句主力是气口（见 _realign_words 的 brk 标记），
-# 这里的宽度上限只做兜底，10 字留给语义断句余量
+CUE_MAX_CHARS = 11                  # 单条字幕最大显示宽度（汉字计 1，英文计 0.55）
+# 实测剪映原生《众神》：703 条，中位 10 字、最长 16 字，13-16 字占 21%。
+# 离线扫描 10/11/12/13/14 五档（用落盘的 6452 个词重放，不调 API）：
+#   10 -> 748 条/均 9.2 字   11 -> 691 条/均 9.9 字   12 -> 644 条/均 10.6 字
+# 11 与原生 703 条/均 9.8 字/2.23s 逐项吻合，故取 11；断点落在标点上时
+# 再放宽到 1.25 倍（≈13 字，原生最长 16 字）
 CUE_MAX_DUR = 6.0                   # 单条最长秒数（超了观众会丢失同步感）
 CUE_MIN_DUR = 1.0                   # 单条最短秒数（太短会闪跳）
 BREAK_GAP = 0.6                     # 词间静音达到该值视为气口，断开（剪映停顿断句同思路）
@@ -122,13 +124,16 @@ def load_config():
     except Exception:
         pass
     # ---- 配置迁移 ----
-    # 老配置文件里 cue_max_chars 存的是当时的默认值 20，会盖掉新版默认的 10，
-    # 导致"改了代码但用户看到的还是 20 字一行"。凡是没打 cfg_ver 的老配置，
-    # 且值正好等于旧默认 20，就按新默认走；用户手动设过的其它值不动。
-    if cfg.get("cfg_ver", 0) < 2:
-        if cfg.get("cue_max_chars") == 20:
+    # 老配置文件里 cue_max_chars 存着当时的默认值（20/10/13），会盖掉新的默认，
+    # 导致"改了代码但用户看到的还是旧值"。未打 cfg_ver 或版本落后的配置，
+    # 值正好命中旧默认序列时按新默认走；用户手动设过的其它值不动。
+    # v4：默认定为 11（离线扫描 10~14 五档，11 与剪映原生 703 条/
+    # 均 9.8 字/2.23s 逐项吻合）。历次迁移写进去的旧默认 20/10/13
+    # 一并升到新默认；用户手改过的其它值不动。
+    if cfg.get("cfg_ver", 0) < 4:
+        if cfg.get("cue_max_chars") in (20, 10, 13):
             cfg["cue_max_chars"] = CUE_MAX_CHARS
-        cfg["cfg_ver"] = 2
+        cfg["cfg_ver"] = 4
     return cfg
 
 
@@ -789,7 +794,7 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                     head, cur = cur[:cut + 1], cur[cut + 1:]
                     flush(head)
                 elif (any(c in t for c in _WEAK_PUNCT)
-                      and would_w <= max_chars * 1.3):
+                      and would_w <= max_chars * 1.25):
                     # 断点正好落在标点上：允许小幅超宽，别把词劈开
                     cur.append((t, ws, we))
                     flush()

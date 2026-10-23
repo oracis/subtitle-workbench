@@ -172,8 +172,8 @@ with open(_cfgp, "w", encoding="utf-8") as f:
 _orig = swb.CONFIG_PATH
 swb.CONFIG_PATH = _cfgp
 _c = swb.load_config()
-assert _c["cue_max_chars"] == swb.CUE_MAX_CHARS == 10, _c["cue_max_chars"]
-assert _c.get("cfg_ver") == 2
+assert _c["cue_max_chars"] == swb.CUE_MAX_CHARS == 11, _c["cue_max_chars"]
+assert _c.get("cfg_ver") == 4
 print("[OK] 老配置 20 字/条 -> 迁移到 %d 字" % swb.CUE_MAX_CHARS)
 
 # 用户手动设过的非旧默认值必须保留
