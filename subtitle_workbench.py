@@ -76,7 +76,9 @@ SILENCE_MIN_DUR = 0.35              # 短于此值的停顿不算语音区间边
 SPEECH_MIN_DUR = 0.12               # 短于此值的"语音"碎片视为噪声丢弃
 CUE_TAIL = 0.10                     # 字幕结束比末词多留的秒数（余韵，勿越入长停顿）
 ALIGN_BREAK_GAP = 0.40              # 对齐态的断句气口门槛：区间间隔达到该值才断
-MIN_CUE_WIDTH = 4                   # 单条最小显示宽度：低于此值的碎条并入上一条，避免闪读
+MIN_CUE_WIDTH = 4
+LOOKBACK_GAP = 0.15                 # 回看切点：宽度将超限时，回过头找 cur 内
+                                    # 间隔 >= 此值且最宽的位置断，而不是就地硬切                   # 单条最小显示宽度：低于此值的碎条并入上一条，避免闪读
 # 口播水词：剪映的断句引擎会忽略"嗯/啊"这类填充词周围的短停顿，不让它单独成条、
 # 也不在这里断句。同理：上一条以水词结尾时，跨越这个气口继续接下文。
 _FILLERS = set("嗯啊呃哦唉诶哎噢呀嘛吧呢哈")
@@ -800,7 +802,24 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                     flush()
                     continue
                 else:
-                    flush()
+                    # 4b) 回看找呼吸点：累计宽度将超限、又不在标点上时，
+                    #     不要就地硬切——Whisper 常给逐字时间戳，"词"已退化
+                    #     成单字，就地切必然切在字中间（实测把"好书"劈成
+                    #     好|书，而原生在"值→解"那 0.21s 换气处断）。
+                    #     回头找 cur 内间隔最大的位置，那里才是真正的气口。
+                    best_j, best_gap = -1, 0.0
+                    for j in range(1, len(cur)):
+                        g = cur[j][1] - cur[j - 1][2]
+                        if g > best_gap:
+                            best_gap, best_j = g, j
+                    head_w = (_display_width(text_of(cur[:best_j]))
+                              if best_j > 0 else 0)
+                    if (best_j > 0 and best_gap >= LOOKBACK_GAP
+                            and head_w >= MIN_CUE_WIDTH):
+                        head, cur = cur[:best_j], cur[best_j:]
+                        flush(head)
+                    else:
+                        flush()
         cur.append((t, ws, we))
         # 2) 句末标点：本词收尾整句
         if any(c in t for c in _STRONG_PUNCT):
