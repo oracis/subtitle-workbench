@@ -792,6 +792,88 @@ def _brk_ahead(words, i, look=3, limit_w=16.0):
     return False
 
 
+_ZH_WORDS = None
+
+
+def _load_wordset():
+    """加载中文词表（与脚本同目录的 zh_words.txt）。缺失时返回空集合，
+    所有切点约束自动失效，退化成"只按宽度断"的旧行为，不影响可用性。"""
+    global _ZH_WORDS
+    if _ZH_WORDS is None:
+        cand = []
+        try:
+            cand.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "zh_words.txt"))
+        except Exception:
+            pass
+        cand.append(os.path.join(os.getcwd(), "zh_words.txt"))
+        if getattr(sys, "_MEIPASS", None):
+            cand.insert(0, os.path.join(sys._MEIPASS, "zh_words.txt"))
+        ws = frozenset()
+        for p in cand:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    ws = frozenset(x.strip() for x in f if x.strip())
+                break
+            except Exception:
+                continue
+        _ZH_WORDS = ws
+    return _ZH_WORDS
+
+
+def _cut_flags(text, wordset=None, maxlen=4):
+    """算出每个位置能不能断开，返回长度 len(text)+1 的布尔表。
+
+    做法是正向 + 逆向两次最大匹配，取交集。单用一种方向会被分词歧义骗到：
+    "自然|而人为" 逆向会切成 "自" + "然而" + "人为"，于是把 "然|而" 判成
+    词内不可切，实际应该允许（这是"自然"的尾巴）。两个方向都认为是词内部的
+    位置才禁切，误判就消掉了。
+
+    词表缺失或空文本时全 True（不做约束，退化成旧行为）。
+    """
+    n = len(text)
+    ws = _load_wordset() if wordset is None else wordset
+    if not ws or n == 0:
+        return [True] * (n + 1)
+
+    def forward():
+        ok = [False] * (n + 1)
+        ok[0] = True
+        i = 0
+        while i < n:
+            hit = False
+            for L in range(min(maxlen, n - i), 1, -1):
+                if text[i:i + L] in ws:
+                    ok[i + L] = True
+                    i += L
+                    hit = True
+                    break
+            if not hit:
+                ok[i + 1] = True
+                i += 1
+        return ok
+
+    def backward():
+        ok = [False] * (n + 1)
+        ok[n] = True
+        i = n
+        while i > 0:
+            hit = False
+            for L in range(min(maxlen, i), 1, -1):
+                if text[i - L:i] in ws:
+                    ok[i - L] = True
+                    i -= L
+                    hit = True
+                    break
+            if not hit:
+                ok[i - 1] = True
+                i -= 1
+        return ok
+
+    f, b = forward(), backward()
+    return [x and y for x, y in zip(f, b)]
+
+
 def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 min_dur=CUE_MIN_DUR, gap=BREAK_GAP):
     """把词级时间戳切成适合屏幕阅读的字幕条。
@@ -809,11 +891,27 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
     words = [w for w in words if (w.get("word") or "").strip()]
     # 再修时间戳畸形（单字跨好几秒）并强制单调，见 _sanitize_words
     words = _sanitize_words(words, max_dur)
+    # 词边界约束：切点必须落在中文词边界上。Whisper 给的是逐字时间戳，没有
+    # 词边界信息，光按宽度切必然把词劈开（实测 683 个切点里 141 个劈在词内，
+    # 20.6%：大英博|物馆、力|量、保|命、野|蛮、横|跨）。用词表做一次逆向最大
+    # 匹配，把每个字的"可切"标记算出来，后面所有切点都从这里选。
+    _texts = [(w.get("word") or "").strip() for w in words]
+    _offs, _acc = [], 0
+    for _t in _texts:
+        _offs.append(_acc)
+        _acc += len(_t)
+    _okcut = _cut_flags("".join(_texts))
+
+    def can_cut(gi):
+        """第 gi 个词之前能不能断（gi=0 是段首，gi=len(words) 是段尾）"""
+        if gi <= 0 or gi >= len(_offs):
+            return True
+        return _okcut[_offs[gi]]
     cues = []
     cur = []  # [(word, start, end), ...]
 
     def text_of(items):
-        return "".join(t for t, _, _ in items)
+        return "".join(t for t, *_ in items)
 
     def flush(items=None):
         nonlocal cur
@@ -874,7 +972,7 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                 elif (any(c in t for c in _WEAK_PUNCT)
                       and would_w <= max_chars * 1.25):
                     # 断点正好落在标点上：允许小幅超宽，别把词劈开
-                    cur.append((t, ws, we))
+                    cur.append((t, ws, we, wi))
                     flush()
                     continue
                 else:
@@ -883,8 +981,11 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                     #     成单字，就地切必然切在字中间（实测把"好书"劈成
                     #     好|书，而原生在"值→解"那 0.21s 换气处断）。
                     #     回头找 cur 内间隔最大的位置，那里才是真正的气口。
+                    base = cur[0][3]
                     best_j, best_gap = -1, 0.0
                     for j in range(1, len(cur)):
+                        if not can_cut(base + j):   # 词内不可切
+                            continue
                         g = cur[j][1] - cur[j - 1][2]
                         if g > best_gap:
                             best_gap, best_j = g, j
@@ -895,8 +996,19 @@ def _split_cues(words, max_chars=CUE_MAX_CHARS, max_dur=CUE_MAX_DUR,
                         head, cur = cur[:best_j], cur[best_j:]
                         flush(head)
                     else:
-                        flush()
-        cur.append((t, ws, we))
+                        # 没有明显气口：退到最靠后的词边界，尽量多装字，
+                        # 但绝不切在词内部（宁可这条短一点，也别出现保|命）
+                        j2 = 0
+                        for j in range(len(cur) - 1, 0, -1):
+                            if can_cut(base + j):
+                                j2 = j
+                                break
+                        if j2 > 0 and _display_width(text_of(cur[:j2])) >= 2:
+                            head, cur = cur[:j2], cur[j2:]
+                            flush(head)
+                        else:
+                            flush()
+        cur.append((t, ws, we, wi))
         # 2) 句末标点：本词收尾整句
         if any(c in t for c in _STRONG_PUNCT):
             if _display_width(text_of(cur)) >= STRONG_MIN_CHARS or len(cur) > 1:

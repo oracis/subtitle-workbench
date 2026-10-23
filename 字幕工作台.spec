@@ -5,7 +5,7 @@ a = Analysis(
     ['subtitle_workbench.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('zh_words.txt', '.')],  # 中文词表：断句时约束切点落在词边界上
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
